@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DRRA Smart Search Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="https://unpkg.com/lucide@latest"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        terracotta: { DEFAULT: '#C6754A', light: '#D9916B' },
+        sage: { DEFAULT: '#7A9383', light: '#9BAF9F' },
+        charcoal: { DEFAULT: '#131313', light: '#333' },
+        linen: { DEFAULT: '#F7F0E9', dark: '#E8DDD0' },
+        sand: { DEFAULT: '#E5DDD3' },
+      },
+      fontFamily: { heading: ['"DM Sans"','sans-serif'], body: ['Inter','sans-serif'] }
+    }
+  }
+}
+</script>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Inter',sans-serif;background:#F7F0E9;color:#131313}
+.font-heading{font-family:'DM Sans',sans-serif}
+.fade-in{animation:fadeIn .3s ease-in}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.bar-animate{transition:width .6s ease}
+.pill{display:inline-flex;align-items:center;padding:2px 10px;border-radius:9999px;font-size:11px;font-weight:500;color:white}
+.card-hover:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.08)}
+.line-clamp-2{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+</style>
+</head>
+<body>
+<!-- Navbar -->
+<nav class="h-14 bg-charcoal text-white flex items-center px-6 justify-between sticky top-0 z-50">
+  <a href="#" onclick="showPage('search')" class="font-heading font-bold text-lg tracking-tight">DRRA<span class="text-terracotta">Smart</span></a>
+  <div class="flex gap-6 text-sm">
+    <a href="#" onclick="showPage('search')" id="nav-search" class="flex items-center gap-1.5 text-terracotta"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>Smart Search</a>
+    <a href="#" onclick="showPage('states')" id="nav-states" class="flex items-center gap-1.5 text-white/70 hover:text-white transition-colors"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="1 6 1 22 8 18 16 22 21 18 21 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></svg>State Profiles</a>
+  </div>
+</nav>
+
+<!-- Page Container -->
+<div id="page-content"></div>
+
+<!-- Footer -->
+<footer class="bg-charcoal text-white/50 text-xs py-4 text-center mt-8">DRRA Project &middot; World Bank &middot; FUNCEME/CEPAS</footer>
+
+<script>
+// ==================== GLOBAL STATE ====================
+let ACTIONS = [];
+let STATE_PROFILES = {};
+let CBRE_LOOKUP = {};
+let ACTION_LOOKUP = {};
+let GLOBAL_STATS = null;
+let IDF = {};
+let ACTION_VECS = {};
+let CHARTS = [];
+
+// ==================== DATA LOADING ====================
+async function loadData() {
+  try {
+    const [a, s, c, g] = await Promise.all([
+      fetch('actions_db.json').then(r=>r.json()),
+      fetch('state_profiles.json').then(r=>r.json()),
+      fetch('cbre_details.json').then(r=>r.json()),
+      fetch('global_stats.json').then(r=>r.json()),
+    ]);
+    ACTIONS = a; STATE_PROFILES = s; GLOBAL_STATS = g;
+    CBRE_LOOKUP = {}; for (const d of c) CBRE_LOOKUP[d.id_acao] = d;
+    ACTION_LOOKUP = {}; for (const d of a) ACTION_LOOKUP[d.id_acao] = d;
+    buildIDF();
+  } catch(e) {
+    document.getElementById('page-content').innerHTML = '<div class="text-center py-20"><h2 class="font-heading text-xl text-red-500 mb-2">Error loading data</h2><p class="text-gray-500">'+e.message+'</p></div>';
+  }
+}
+
+// ==================== TF-IDF ENGINE ====================
+function tokenize(text) {
+  return text.toLowerCase().split(/[^a-zà-ú0-9]+/).filter(t => t.length >= 3);
+}
+
+function buildIDF() {
+  const totalDocs = ACTIONS.length;
+  const docFreq = {};
+  for (const a of ACTIONS) {
+    const tokens = new Set(tokenize(a.descricao));
+    for (const t of tokens) docFreq[t] = (docFreq[t] || 0) + 1;
+  }
+  for (const [t, f] of Object.entries(docFreq)) {
+    IDF[t] = Math.log(totalDocs / (1 + f));
+  }
+  // Pre-compute vectors
+  for (const a of ACTIONS) {
+    const tokens = tokenize(a.descricao);
+    const tf = {};
+    for (const t of tokens) tf[t] = (tf[t] || 0) + 1;
+    const vec = {};
+    for (const [t, c] of Object.entries(tf)) {
+      if (IDF[t]) vec[t] = c * IDF[t];
+    }
+    ACTION_VECS[a.id_acao] = vec;
+  }
+}
+
+function searchSimilar(query, topK = 10) {
+  const qTokens = tokenize(query);
+  if (qTokens.length === 0) return [];
+  const qTF = {};
+  for (const t of qTokens) qTF[t] = (qTF[t] || 0) + 1;
+  const qVec = {};
+  for (const [t, c] of Object.entries(qTF)) {
+    if (IDF[t]) qVec[t] = c * IDF[t];
+  }
+  const qSet = new Set(qTokens);
+  let qNorm = 0;
+  for (const v of Object.values(qVec)) qNorm += v * v;
+  qNorm = Math.sqrt(qNorm);
+  if (qNorm === 0) return [];
+
+  const results = [];
+  for (const a of ACTIONS) {
+    const aVec = ACTION_VECS[a.id_acao];
+    if (!aVec) continue;
+    let dot = 0, aNorm = 0;
+    for (const [t, vA] of Object.entries(aVec)) {
+      const vQ = qVec[t] || 0;
+      dot += vA * vQ;
+      aNorm += vA * vA;
+    }
+    if (aNorm === 0) continue;
+    const sim = dot / (Math.sqrt(aNorm) * qNorm);
+    if (sim > 0) {
+      const aTokens = new Set(tokenize(a.descricao));
+      const shared = [...qSet].filter(t => aTokens.has(t));
+      results.push({ action: a, similarity: sim, sharedKeywords: shared });
+    }
+  }
+  results.sort((a, b) => b.similarity - a.similarity);
+  return results.slice(0, topK);
+}
+
+// ==================== HELPERS ====================
+function getStateColor(code) { return (GLOBAL_STATS && GLOBAL_STATS.state_colors[code]) || '#999'; }
+function getStateName(code) { return (GLOBAL_STATS && GLOBAL_STATS.state_names[code]) || code; }
+function getStates(a) { return (a.states_detected||'').split(',').map(s=>s.trim()).filter(Boolean); }
+function getJudgment(ICBRE, score) {
+  if (ICBRE >= 3.8 && score >= 0.6) return { label: 'Excellent', cls: 'bg-emerald-500' };
+  if (ICBRE >= 3.4) return { label: 'Good', cls: 'bg-sage' };
+  if (ICBRE >= 3.0) return { label: 'Average', cls: 'bg-amber-500' };
+  return { label: 'Below avg', cls: 'bg-red-500' };
+}
+function icbreColor(v) { if (v >= 3.8) return 'bg-emerald-500'; if (v >= 3.4) return 'bg-sage'; if (v >= 3.0) return 'bg-amber-400'; return 'bg-red-400'; }
+let searchTimeout;
+
+// ==================== PAGE: SMART SEARCH ====================
+function renderSearch() {
+  return `
+  <div class="max-w-5xl mx-auto px-4 py-8 fade-in">
+    <div class="text-center mb-8">
+      <h1 class="font-heading text-4xl font-bold text-charcoal mb-2">DRRA Smart Action Search</h1>
+      <p class="text-gray-500 max-w-2xl mx-auto">Describe any drought resilience action and find the most similar actions in our portfolio of 1,204 prioritized actions.</p>
+    </div>
+    <div class="relative max-w-2xl mx-auto mb-4">
+      <svg class="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+      <input type="text" id="search-input" placeholder="e.g., 'Build rainwater harvesting cisterns'"
+        class="w-full pl-12 pr-4 py-4 rounded-xl border border-sand bg-white shadow-sm text-base focus:outline-none focus:ring-2 focus:ring-terracotta/50"
+        oninput="handleSearchInput(this.value)"/>
+    </div>
+    <div class="flex flex-wrap justify-center gap-2 mb-8">
+      ${['Water loss reduction program','IoT monitoring for reservoirs','Community cisterns for drought resilience'].map(ex =>
+        `<button onclick="setSearch('${ex}')" class="text-sm px-3 py-1.5 rounded-full bg-sand hover:bg-terracotta/10 text-charcoal transition-colors">${ex}</button>`
+      ).join('')}
+    </div>
+    <div id="search-results"></div>
+  </div>`;
+}
+
+function setSearch(q) {
+  document.getElementById('search-input').value = q;
+  handleSearchInput(q);
+}
+
+function handleSearchInput(query) {
+  clearTimeout(searchTimeout);
+  searchTimeout = setTimeout(() => doSearch(query), 300);
+}
+
+function doSearch(query) {
+  const container = document.getElementById('search-results');
+  if (!query.trim()) { container.innerHTML = ''; return; }
+  const results = searchSimilar(query, 12);
+  if (results.length === 0) { container.innerHTML = '<div class="text-center text-gray-400 py-12">No similar actions found. Try different keywords.</div>'; return; }
+
+  const expanded = new Set();
+  container.innerHTML = `<h2 class="font-heading text-xl font-semibold mb-4">Top ${results.length} most similar actions</h2><div class="space-y-4">` +
+    results.map((r, i) => {
+      const a = r.action;
+      const j = getJudgment(a.ICBRE, a.score_base);
+      const states = getStates(a);
+      const pct = Math.round((a.posicao_base / 1204) * 100);
+      return `
+      <div class="bg-white rounded-xl border border-sand shadow-xs p-5 card-hover transition-all duration-300">
+        <div class="flex flex-wrap items-center gap-2 mb-3">
+          <span class="bg-charcoal text-white text-xs font-bold px-2 py-1 rounded">#${i+1}</span>
+          <a href="#" onclick="showAction('${a.id_acao}')" class="font-heading font-semibold text-terracotta hover:underline">${a.id_acao}</a>
+          <span class="text-xs font-medium px-2 py-0.5 rounded-full ${r.similarity>=0.5?'bg-emerald-100 text-emerald-700':r.similarity>=0.3?'bg-amber-100 text-amber-700':'bg-red-100 text-red-700'}">${Math.round(r.similarity*100)}% match</span>
+          <span class="pill ${a.classe_programa==='Classe 1'?'bg-terracotta':a.classe_programa==='Classe 2'?'bg-sage':'bg-gray-500'}">${a.classe_programa}</span>
+          <span class="pill ${j.cls}">${j.label}</span>
+        </div>
+        <p class="text-sm text-gray-700 mb-2 leading-relaxed line-clamp-2">${a.descricao}</p>
+        ${r.sharedKeywords.length>0?`<div class="flex flex-wrap gap-1 mb-3"><span class="text-xs text-gray-400">Shared:</span>${r.sharedKeywords.map(k=>`<span class="text-xs bg-terracotta/10 text-terracotta px-1.5 py-0.5 rounded">${k}</span>`).join('')}</div>`:''}
+        <div class="grid grid-cols-4 gap-3 mb-3">
+          ${['ICBRE','EO','GCA','AHP'].map((label,li) => {
+            const val = li===0?a.ICBRE:li===1?a.EO_media:li===2?a.GCA_media:a.score_base;
+            const barVal = li===3?val*5:val;
+            return `<div><span class="text-xs text-gray-400">${label}</span><div class="w-full bg-gray-200 rounded-full h-2 mt-1"><div class="${icbreColor(barVal)} h-2 rounded-full bar-animate" style="width:${(barVal/5)*100}%"></div></div><span class="text-xs font-semibold">${li===3?val.toFixed(3):val.toFixed(2)}</span></div>`;
+          }).join('')}
+        </div>
+        <div class="flex flex-wrap gap-1.5 mb-2">
+          ${states.map(s=>`<span class="pill" style="background:${getStateColor(s)}">${s}</span>`).join('')}
+          <span class="bg-sand text-charcoal pill">${a.area_tematica_D1}</span>
+          <span class="bg-sand text-charcoal pill">${a.maturidade_D1}</span>
+        </div>
+        <div class="text-xs text-gray-400 mb-2">Ranked <strong>#${a.posicao_base}</strong> of 1,204 &middot; Top ${pct}%
+          <div class="w-full bg-gray-100 rounded-full h-1.5 mt-1"><div class="bg-terracotta h-1.5 rounded-full bar-animate" style="width:${pct}%"></div></div>
+        </div>
+        <button onclick="toggleCbre('${a.id_acao}')" class="text-xs text-terracotta flex items-center gap-1 hover:underline" id="cbre-btn-${a.id_acao}">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg> Show CBRE details
+        </button>
+        <div id="cbre-${a.id_acao}" class="hidden mt-3 p-3 bg-linen rounded-lg"></div>
+      </div>`;
+    }).join('') + '</div>';
+}
+
+function toggleCbre(id) {
+  const el = document.getElementById('cbre-'+id);
+  const btn = document.getElementById('cbre-btn-'+id);
+  const cbre = CBRE_LOOKUP[id];
+  if (el.classList.contains('hidden')) {
+    el.classList.remove('hidden');
+    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg> Hide CBRE details';
+    if (!cbre) { el.innerHTML = '<div class="text-xs text-gray-400">No CBRE data</div>'; return; }
+    const items = [
+      {l:'Cost (C)',v:cbre.C_agregado,s:`C1=${cbre.C1_CAPEX} C2=${cbre.C2_OPEX} C3=${cbre.C3_Custo_institucional}`},
+      {l:'Co-benefits (CB)',v:cbre.CB_agregado,s:`Soc=${cbre.CBs_sociais} Env=${cbre.CBa_ambientais} Econ=${cbre.CBe_economicos}`},
+      {l:'Robustness (R)',v:cbre.R_agregado,s:`R1=${cbre.R1_robustez_hidrologica_climatica} R2=${cbre.R2_robustez_institucional_operacional}`},
+      {l:'Scale (S)',v:cbre.S_agregado,s:`S1=${cbre.S1_escala_escopo} S2=${cbre.S2_adequacao_problema}`},
+    ];
+    el.innerHTML = items.map(it=>`<div class="mb-2"><div class="flex justify-between text-xs"><span class="font-medium">${it.l}</span><span class="font-bold">${it.v.toFixed(2)}</span></div><div class="w-full bg-gray-200 rounded-full h-1.5"><div class="bg-terracotta h-1.5 rounded-full bar-animate" style="width:${(it.v/5)*100}%"></div></div><span class="text-[10px] text-gray-400">${it.s}</span></div>`).join('');
+  } else {
+    el.classList.add('hidden');
+    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg> Show CBRE details';
+  }
+}
+
+// ==================== PAGE: STATE PROFILES ====================
+function renderStates() {
+  if (!GLOBAL_STATS) return '<div class="text-center py-12">Loading...</div>';
+  const codes = GLOBAL_STATS.ne_states;
+  return `
+  <div class="max-w-6xl mx-auto px-4 py-8 fade-in">
+    <div class="text-center mb-8">
+      <h1 class="font-heading text-3xl font-bold text-charcoal mb-2">State Profiles</h1>
+      <p class="text-gray-500">Explore drought resilience action portfolios across 9 Northeast Brazil states</p>
+    </div>
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+      ${codes.map(code => {
+        const p = STATE_PROFILES[code];
+        if (!p) return '';
+        const col = getStateColor(code);
+        const name = getStateName(code);
+        return `<a href="#" onclick="showState('${code}')" class="bg-white rounded-xl border border-sand shadow-xs card-hover transition-all duration-300 block">
+          <div class="h-1.5 rounded-t-xl" style="background:${col}"></div>
+          <div class="p-5">
+            <div class="flex items-center gap-2 mb-3">
+              <span class="w-8 h-8 rounded-lg flex items-center justify-center text-white text-xs font-bold" style="background:${col}">${code}</span>
+              <span class="font-heading font-semibold text-lg text-charcoal">${name}</span>
+            </div>
+            <div class="grid grid-cols-2 gap-3 text-sm">
+              <div class="bg-linen rounded-lg p-2 text-center"><div class="text-lg font-bold text-charcoal">${p.total_actions}</div><div class="text-xs text-gray-400">Actions</div></div>
+              <div class="bg-linen rounded-lg p-2 text-center"><div class="text-lg font-bold text-charcoal">${p.avg_ICBRE.toFixed(2)}</div><div class="text-xs text-gray-400">Avg ICBRE</div></div>
+            </div>
+            <div class="mt-3 text-xs text-gray-400">${p.specific_actions} state-specific · ${p.regional_actions} regional</div>
+          </div>
+        </a>`;
+      }).join('')}
+    </div>
+  </div>`;
+}
+
+// ==================== PAGE: STATE DETAIL ====================
+function renderStateDetail(code) {
+  const p = STATE_PROFILES[code];
+  if (!p || !GLOBAL_STATS) return '<div class="text-center py-12">Not found</div>';
+  const col = getStateColor(code);
+  const name = getStateName(code);
+  const capagVal = GLOBAL_STATS.capag_values[code] || 0;
+  const capagLabel = capagVal>=4.5?'Excellent':capagVal>=4?'Good':capagVal>=3?'Moderate':capagVal>=2?'Limited':'Very Limited';
+
+  const classData = Object.entries(p.classe_distribution).map(([k,v])=>({name:k,value:v}));
+  const themeData = Object.entries(p.theme_distribution).map(([k,v])=>({name:k,value:v})).sort((a,b)=>b.value-a.value).slice(0,5);
+  const compareData = [
+    {metric:'ICBRE',state:p.avg_ICBRE,national:GLOBAL_STATS.avg_ICBRE},
+    {metric:'EO',state:p.avg_EO,national:GLOBAL_STATS.avg_EO},
+    {metric:'GCA',state:p.avg_GCA,national:GLOBAL_STATS.avg_GCA},
+  ];
+
+  setTimeout(function() {
+    destroyCharts();
+    var ctx1 = document.getElementById('chart-class');
+    if (ctx1) {
+      CHARTS.push(new Chart(ctx1, {
+        type:'doughnut',
+        data:{labels:classData.map(function(d){return d.name}), datasets:[{data:classData.map(function(d){return d.value}), backgroundColor:['#C6754A','#7A9383','#4A5568']}]},
+        options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom', labels:{font:{size:11}}}}}
+      }));
+    }
+    var ctx2 = document.getElementById('chart-compare');
+    if (ctx2) {
+      CHARTS.push(new Chart(ctx2, {
+        type:'bar',
+        data:{labels:compareData.map(function(d){return d.metric}), datasets:[
+          {label:code, data:compareData.map(function(d){return d.state}), backgroundColor:col, borderRadius:4},
+          {label:'National', data:compareData.map(function(d){return d.national}), backgroundColor:'#E5DDD3', borderRadius:4}
+        ]},
+        options:{responsive:true, maintainAspectRatio:false, scales:{y:{min:2.5,max:4}}, plugins:{legend:{position:'bottom'}}}
+      }));
+    }
+    var ctx3 = document.getElementById('chart-theme');
+    if (ctx3) {
+      CHARTS.push(new Chart(ctx3, {
+        type:'bar',
+        data:{labels:themeData.map(function(d){return d.name.substring(0,20)}), datasets:[{data:themeData.map(function(d){return d.value}), backgroundColor:col, borderRadius:4}]},
+        options:{indexAxis:'y', responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}}
+      }));
+    }
+  }, 50);
+
+  function whyAction(a) {
+    const r = [];
+    if (a.is_regional) r.push('Regional action'); else r.push('State-specific');
+    if (a.ICBRE>=3.8) r.push('High cost-benefit');
+    if (a.EO_media>=3.5) r.push('Strong operational effectiveness');
+    if (a.GCA_media>=3.5) r.push('High adaptive capacity');
+    if (a.classe_programa==='Classe 1') r.push('Quick win (<=12 months)');
+    if (a.maturidade==='Implementação') r.push('Ready to implement');
+    return r.join(' + ');
+  }
+
+  return `
+  <div class="max-w-6xl mx-auto px-4 py-6 fade-in">
+    <a href="#" onclick="showPage('states')" class="text-sm text-terracotta flex items-center gap-1 mb-4 hover:underline">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg> Back to states
+    </a>
+    <div class="flex items-center gap-3 mb-6">
+      <span class="w-12 h-12 rounded-xl flex items-center justify-center text-white text-lg font-bold" style="background:${col}">${code}</span>
+      <div><h1 class="font-heading text-3xl font-bold text-charcoal">${name}</h1><p class="text-gray-500 text-sm">${p.total_actions} actions (${p.specific_actions} state-specific + ${p.regional_actions} regional)</p></div>
+    </div>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+      <div class="bg-white rounded-xl border border-sand p-4"><div class="text-xs text-gray-400">Total Actions</div><div class="text-2xl font-bold text-charcoal">${p.total_actions}</div></div>
+      <div class="bg-white rounded-xl border border-sand p-4"><div class="text-xs text-gray-400">State-Specific</div><div class="text-2xl font-bold text-charcoal">${p.specific_actions}</div></div>
+      <div class="bg-white rounded-xl border border-sand p-4"><div class="text-xs text-gray-400">Avg ICBRE</div><div class="text-2xl font-bold" style="color:${col}">${p.avg_ICBRE.toFixed(2)}</div></div>
+      <div class="bg-white rounded-xl border border-sand p-4"><div class="text-xs text-gray-400">CAPAG</div><div class="text-lg font-bold text-charcoal">${capagLabel}</div><div class="text-xs text-gray-400">${capagVal}/5</div></div>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+      <div class="bg-white rounded-xl border border-sand p-4"><h3 class="font-heading font-semibold text-sm mb-2">Class Distribution</h3><div style="height:200px"><canvas id="chart-class"></canvas></div></div>
+      <div class="bg-white rounded-xl border border-sand p-4"><h3 class="font-heading font-semibold text-sm mb-2">Score Comparison</h3><div style="height:200px"><canvas id="chart-compare"></canvas></div></div>
+    </div>
+    <div class="bg-white rounded-xl border border-sand p-4 mb-6"><h3 class="font-heading font-semibold text-sm mb-2">Top Themes</h3><div style="height:180px"><canvas id="chart-theme"></canvas></div></div>
+    <div class="bg-white rounded-xl border border-sand p-5 mb-6">
+      <h3 class="font-heading text-xl font-bold mb-1">Top 20 Recommended Actions</h3>
+      <p class="text-sm text-gray-400 mb-4">Based on AHP ranking with state-specific relevance</p>
+      <div class="space-y-3">
+        ${p.top20.map((a,i)=>{
+          const medal = i===0?'🥇':i===1?'🥈':i===2?'🥉':`${i+1}.`;
+          return `<div class="flex gap-3 p-3 rounded-lg hover:bg-linen transition-colors">
+            <div class="text-lg font-bold text-terracotta w-8 text-center shrink-0">${medal}</div>
+            <div class="flex-1 min-w-0">
+              <div class="flex flex-wrap items-center gap-2 mb-1">
+                <a href="#" onclick="showAction('${a.id_acao}')" class="font-semibold text-sm text-terracotta hover:underline">${a.id_acao}</a>
+                <span class="text-[10px] px-1.5 py-0.5 rounded text-white ${a.classe_programa==='Classe 1'?'bg-terracotta':a.classe_programa==='Classe 2'?'bg-sage':'bg-gray-500'}">${a.classe_programa}</span>
+                <span class="text-xs text-gray-400">${a.score_base.toFixed(3)}</span>
+              </div>
+              <p class="text-sm text-gray-700 line-clamp-2 mb-1">${a.descricao}</p>
+              <p class="text-xs text-sage">${whyAction(a)}</p>
+            </div>
+            <div class="text-right shrink-0 hidden sm:block"><div class="text-xs font-bold text-charcoal">ICBRE ${a.ICBRE.toFixed(2)}</div><div class="text-xs text-gray-400">EO ${a.EO_media} · GCA ${a.GCA_media}</div></div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+    <div class="bg-white rounded-xl border border-sand p-4">
+      <h3 class="font-heading font-semibold text-sm mb-3">State vs National Comparison</h3>
+      <table class="w-full text-sm">
+        <thead><tr class="border-b border-sand"><th class="text-left py-2 text-gray-400 font-normal">Metric</th><th class="text-right py-2 text-gray-400 font-normal">${code}</th><th class="text-right py-2 text-gray-400 font-normal">National</th><th class="text-right py-2 text-gray-400 font-normal">Diff</th></tr></thead>
+        <tbody>
+          ${compareData.map(row=>{
+            const diff=row.state-row.national;
+            return `<tr class="border-b border-sand/50"><td class="py-2 font-medium">${row.metric}</td><td class="text-right py-2 font-bold" style="color:${col}">${row.state.toFixed(2)}</td><td class="text-right py-2 text-gray-500">${row.national.toFixed(2)}</td><td class="text-right py-2 ${diff>=0?'text-emerald-600':'text-red-500'}">${diff>=0?'+':''}${diff.toFixed(2)}</td></tr>`;
+          }).join('')}
+          <tr><td class="py-2 font-medium">Quick Wins</td><td class="text-right py-2 font-bold" style="color:${col}">${p.quick_wins}</td><td class="text-right py-2 text-gray-500">${Math.round(GLOBAL_STATS.classe1_count/9)}</td><td class="text-right py-2 text-emerald-600">+${p.quick_wins-Math.round(GLOBAL_STATS.classe1_count/9)}</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+// ==================== PAGE: ACTION DETAIL ====================
+function renderActionDetail(id) {
+  const a = ACTION_LOOKUP[id];
+  const cbre = CBRE_LOOKUP[id];
+  if (!a || !GLOBAL_STATS) return '<div class="text-center py-12">Action not found</div>';
+  const j = getJudgment(a.ICBRE, a.score_base);
+  const states = getStates(a);
+  const pct = Math.round((a.posicao_base/1204)*100);
+
+  setTimeout(function() {
+    destroyCharts();
+    if (cbre) {
+      var ctx1 = document.getElementById('chart-radar');
+      if (ctx1) {
+        CHARTS.push(new Chart(ctx1, {
+          type:'radar',
+          data:{labels:['Cost','Co-benefits','Robustness','Scale'], datasets:[{label:'Score', data:[cbre.C_agregado,cbre.CB_agregado,cbre.R_agregado,cbre.S_agregado], borderColor:'#C6754A', backgroundColor:'rgba(198,117,74,0.2)', pointBackgroundColor:'#C6754A'}]},
+          options:{responsive:true, maintainAspectRatio:false, scales:{r:{min:0,max:5,ticks:{stepSize:1}}}, plugins:{legend:{display:false}}}
+        }));
+      }
+      var ctx2 = document.getElementById('chart-sub');
+      if (ctx2) {
+        CHARTS.push(new Chart(ctx2, {
+          type:'bar',
+          data:{labels:['C1','C2','C3','CBs','CBa','CBe','R1','R2','S1','S2'], datasets:[{data:[cbre.C1_CAPEX,cbre.C2_OPEX,cbre.C3_Custo_institucional,cbre.CBs_sociais,cbre.CBa_ambientais,cbre.CBe_economicos,cbre.R1_robustez_hidrologica_climatica,cbre.R2_robustez_institucional_operacional,cbre.S1_escala_escopo,cbre.S2_adequacao_problema], backgroundColor:'#7A9383', borderRadius:4}]},
+          options:{responsive:true, maintainAspectRatio:false, scales:{y:{max:5}}, plugins:{legend:{display:false}}}
+        }));
+      }
+    }
+  }, 50);
+
+  return `
+  <div class="max-w-4xl mx-auto px-4 py-6 fade-in">
+    <a href="#" onclick="history.back()" class="text-sm text-terracotta flex items-center gap-1 mb-4 hover:underline"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg> Back</a>
+    <div class="bg-white rounded-xl border border-sand p-6 mb-4">
+      <div class="flex flex-wrap items-center gap-3 mb-3">
+        <h1 class="font-heading text-2xl font-bold text-charcoal">${a.id_acao}</h1>
+        <span class="pill ${a.classe_programa==='Classe 1'?'bg-terracotta':a.classe_programa==='Classe 2'?'bg-sage':'bg-gray-500'}">${a.classe_programa}</span>
+      </div>
+      <p class="text-gray-700 leading-relaxed mb-4">${a.descricao}</p>
+      <div class="flex flex-wrap gap-2 mb-4">
+        ${states.map(s=>`<a href="#" onclick="showState('${s}')" class="pill hover:opacity-80 transition-opacity" style="background:${getStateColor(s)}">${getStateName(s)} (${s})</a>`).join('')}
+        ${a.is_regional_ne===1?'<span class="pill bg-terracotta/20 text-terracotta">Regional NE</span>':''}
+      </div>
+      <div class="flex items-center gap-4">
+        <div class="text-center"><div class="text-3xl font-bold text-charcoal">#${a.posicao_base}</div><div class="text-xs text-gray-400">of 1,204</div></div>
+        <div class="flex-1"><div class="text-xs text-gray-400 mb-1">Top ${pct}%</div><div class="w-full bg-gray-100 rounded-full h-3"><div class="bg-terracotta h-3 rounded-full bar-animate" style="width:${pct}%"></div></div></div>
+      </div>
+    </div>
+    <div class="${j.cls.replace('bg-','bg-').replace('bg-emerald-500','bg-emerald-50').replace('bg-sage','bg-green-50').replace('bg-amber-500','bg-amber-50').replace('bg-red-500','bg-red-50')} rounded-xl border border-sand p-4 mb-4 flex items-start gap-3">
+      <div class="mt-0.5 ${j.cls.replace('bg-','text-')}"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="7"/><polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"/></svg></div>
+      <div><div class="font-heading font-bold ${j.cls.replace('bg-','text-')}">${j.label}</div><div class="text-sm text-gray-600">${j.label==='Excellent'?'Outstanding cost-benefit ratio with strong operational capacity':j.label==='Good'?'Solid action with favorable balance of costs and benefits':j.label==='Average'?'Moderate performance, may need improvement':'Needs significant improvement or additional support'}</div></div>
+    </div>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+      <div class="bg-white rounded-xl border border-sand p-4 text-center"><div class="text-xs text-gray-400">ICBRE</div><div class="text-2xl font-bold text-charcoal">${a.ICBRE.toFixed(2)}</div><div class="text-xs text-gray-400">/ 5.0</div></div>
+      <div class="bg-white rounded-xl border border-sand p-4 text-center"><div class="text-xs text-gray-400">EO</div><div class="text-2xl font-bold text-charcoal">${a.EO_media.toFixed(2)}</div><div class="text-xs text-gray-400">/ 5.0</div></div>
+      <div class="bg-white rounded-xl border border-sand p-4 text-center"><div class="text-xs text-gray-400">GCA</div><div class="text-2xl font-bold text-charcoal">${a.GCA_media.toFixed(2)}</div><div class="text-xs text-gray-400">/ 5.0</div></div>
+      <div class="bg-white rounded-xl border border-sand p-4 text-center"><div class="text-xs text-gray-400">AHP Score</div><div class="text-2xl font-bold text-charcoal">${a.score_base.toFixed(4)}</div><div class="text-xs text-gray-400">/ 1.0</div></div>
+    </div>
+    <div class="bg-white rounded-xl border border-sand p-4 mb-4">
+      <h3 class="font-heading font-semibold text-sm mb-3">Classification</h3>
+      <div class="grid grid-cols-2 md:grid-cols-3 gap-3 text-sm">
+        <div><span class="text-gray-400">Theme:</span> <strong>${a.area_tematica_D1}</strong></div>
+        <div><span class="text-gray-400">Type:</span> <strong>${a.tipo_D1}</strong></div>
+        <div><span class="text-gray-400">Maturity:</span> <strong>${a.maturidade_D1}</strong></div>
+        <div><span class="text-gray-400">Scale:</span> <strong>${a.escala_D1}</strong></div>
+        <div><span class="text-gray-400">Spatial:</span> <strong>${a.loc_espacial_D1}</strong></div>
+        <div><span class="text-gray-400">Timeline:</span> <strong>${a.prazo_programa}</strong></div>
+      </div>
+      ${a.sinergias_D1?`<div class="mt-2 text-sm"><span class="text-gray-400">Synergies:</span> <span class="text-sage">${a.sinergias_D1}</span></div>`:''}
+    </div>
+    ${cbre?`<div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+      <div class="bg-white rounded-xl border border-sand p-4"><h3 class="font-heading font-semibold text-sm mb-3">CBRE Profile</h3><div style="height:250px"><canvas id="chart-radar"></canvas></div></div>
+      <div class="bg-white rounded-xl border border-sand p-4"><h3 class="font-heading font-semibold text-sm mb-3">CBRE Sub-criteria</h3><div style="height:250px"><canvas id="chart-sub"></canvas></div></div>
+    </div>`:''}
+    ${a.ICBRE_CAPAG?`<div class="bg-white rounded-xl border border-sand p-4"><h3 class="font-heading font-semibold text-sm mb-2">CAPAG Adjustment</h3><div class="flex items-center gap-4 text-sm"><div>ICBRE (raw): <strong>${a.ICBRE.toFixed(2)}</strong></div><div>→</div><div>ICBRE (CAPAG): <strong class="text-terracotta">${a.ICBRE_CAPAG.toFixed(2)}</strong></div></div></div>`:''}
+  </div>`;
+}
+
+// ==================== ROUTING ====================
+let currentPage = 'search';
+
+function showPage(page) {
+  currentPage = page;
+  destroyCharts();
+  updateNav();
+  if (page === 'search') document.getElementById('page-content').innerHTML = renderSearch();
+  else if (page === 'states') document.getElementById('page-content').innerHTML = renderStates();
+  window.scrollTo(0,0);
+}
+
+function showState(code) {
+  currentPage = 'state-' + code;
+  destroyCharts();
+  updateNav();
+  document.getElementById('page-content').innerHTML = renderStateDetail(code);
+  window.scrollTo(0,0);
+}
+
+function showAction(id) {
+  currentPage = 'action-' + id;
+  destroyCharts();
+  updateNav();
+  document.getElementById('page-content').innerHTML = renderActionDetail(id);
+  window.scrollTo(0,0);
+}
+
+function updateNav() {
+  const s = document.getElementById('nav-search');
+  const st = document.getElementById('nav-states');
+  if (!s || !st) return;
+  if (currentPage === 'search') { s.className = 'flex items-center gap-1.5 text-terracotta'; st.className = 'flex items-center gap-1.5 text-white/70 hover:text-white transition-colors'; }
+  else { s.className = 'flex items-center gap-1.5 text-white/70 hover:text-white transition-colors'; st.className = 'flex items-center gap-1.5 text-terracotta'; }
+}
+
+function destroyCharts() {
+  for (const c of CHARTS) c.destroy();
+  CHARTS = [];
+}
+
+// ==================== INIT ====================
+loadData().then(() => showPage('search'));
+</script>
+</body>
+</html>
